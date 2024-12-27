@@ -11,3 +11,7 @@ target_sources(app PRIVATE
   )
 
 zephyr_library_include_directories(${ZEPHYR_BASE}/samples/bluetooth)
+
+add_subdirectory(src/max30102)
+add_subdirectory(src/mpu6050)
+add_subdirectory(src/data_svc)

@@ -6,7 +6,7 @@
  *
  * SPDX-License-Identifier: Apache-2.0
  */
-
+#include <zephyr/kernel.h>
 #include <zephyr/device.h>
 #include <zephyr/devicetree.h>
 
@@ -15,295 +15,233 @@
 #include <zephyr/bluetooth/conn.h>
 #include <zephyr/bluetooth/uuid.h>
 #include <zephyr/bluetooth/gatt.h>
-#include <zephyr/bluetooth/services/bas.h>
-#include <zephyr/bluetooth/services/hrs.h>
 
-static bool hrf_ntf_enabled;
+#include <zephyr/drivers/i2c.h>
 
-static const struct bt_data ad[] = {
+#include "max30102.h"
+#include "mpu6050.h"
+#include "data_svc.h"
+
+max_ctx_t * max_c;
+mpu_ctx_t * mpu_c;
+
+struct bt_conn *my_connection;
+
+#define DEVICE_NAME 		CONFIG_BT_DEVICE_NAME // Set in proj.conf
+#define DEVICE_NAME_LEN        	(sizeof(DEVICE_NAME) - 1)
+static K_SEM_DEFINE(ble_init_ok, 0, 1);
+
+void init_max30102(struct i2c_dt_spec * dev)
+{
+	max_c = max_create(dev);
+	uint8_t redLedBrightness = 0x30; // Options: 0=Off to 255=50mA
+	uint8_t irLedBrightness = 0x30;	 // Options: 0=Off to 255=50mA
+	uint8_t sampleAverage = 4;		 // Options: 1, 2, 4, 8, 16, 32
+	uint8_t ledMode = 2;			 // Options: 1 = Red only, 2 = Red + IR
+	int sampleRate = 3200;			 // Options: 50, 100, 200, 400, 800, 1000, 1600, 3200
+	int pulseWidth = 69;			 // Options: 69, 118, 215, 411
+	int adcRange = 4096;			 // Options: 2048, 4096, 8192, 16384
+	max_setup(max_c, redLedBrightness, irLedBrightness, sampleAverage, ledMode, sampleRate, pulseWidth, adcRange);
+	return;
+}
+
+void init_mpu6050(struct i2c_dt_spec * dev)
+{
+	mpu_c = MPU6050_create(dev);
+    MPU6050_reset(mpu_c);
+    MPU6050_initialize(mpu_c);
+	return;
+}
+
+static const struct bt_data ad[] = 
+{
 	BT_DATA_BYTES(BT_DATA_FLAGS, (BT_LE_AD_GENERAL | BT_LE_AD_NO_BREDR)),
-	BT_DATA_BYTES(BT_DATA_UUID16_ALL,
-		      BT_UUID_16_ENCODE(BT_UUID_HRS_VAL),
-		      BT_UUID_16_ENCODE(BT_UUID_BAS_VAL),
-		      BT_UUID_16_ENCODE(BT_UUID_DIS_VAL)),
-#if defined(CONFIG_BT_EXT_ADV)
-	BT_DATA(BT_DATA_NAME_COMPLETE, CONFIG_BT_DEVICE_NAME, sizeof(CONFIG_BT_DEVICE_NAME) - 1),
-#endif /* CONFIG_BT_EXT_ADV */
+	BT_DATA(BT_DATA_NAME_COMPLETE, DEVICE_NAME, DEVICE_NAME_LEN),
 };
 
-#if !defined(CONFIG_BT_EXT_ADV)
-static const struct bt_data sd[] = {
-	BT_DATA(BT_DATA_NAME_COMPLETE, CONFIG_BT_DEVICE_NAME, sizeof(CONFIG_BT_DEVICE_NAME) - 1),
+static const struct bt_data sd[] = 
+{
+	BT_DATA_BYTES(BT_DATA_UUID128_ALL, MY_SERVICE_UUID),
 };
-#endif /* !CONFIG_BT_EXT_ADV */
 
-/* Use atomic variable, 2 bits for connection and disconnection state */
-static ATOMIC_DEFINE(state, 2U);
-
-#define STATE_CONNECTED    1U
-#define STATE_DISCONNECTED 2U
+struct bt_conn *my_connection;
 
 static void connected(struct bt_conn *conn, uint8_t err)
 {
-	if (err) {
-		printk("Connection failed, err 0x%02x %s\n", err, bt_hci_err_to_str(err));
-	} else {
-		printk("Connected\n");
+	struct bt_conn_info info; 
+	char addr[BT_ADDR_LE_STR_LEN];
 
-		(void)atomic_set_bit(state, STATE_CONNECTED);
+	my_connection = conn;
+
+	if (err) 
+	{
+		printk("Connection failed (err %u)\n", err);
+		return;
+	}
+	else if(bt_conn_get_info(conn, &info))
+	{
+		printk("Could not parse connection info\n");
+	}
+	else
+	{
+		bt_addr_le_to_str(bt_conn_get_dst(conn), addr, sizeof(addr));
+		
+		printk("Connection established!		\n\
+		Connected to: %s					\n\
+		Role: %u							\n\
+		Connection interval: %u				\n\
+		Slave latency: %u					\n\
+		Connection supervisory timeout: %u	\n"
+		, addr, info.role, info.le.interval, info.le.latency, info.le.timeout);
 	}
 }
 
 static void disconnected(struct bt_conn *conn, uint8_t reason)
 {
-	printk("Disconnected, reason 0x%02x %s\n", reason, bt_hci_err_to_str(reason));
-
-	(void)atomic_set_bit(state, STATE_DISCONNECTED);
+	printk("Disconnected (reason %u)\n", reason);
 }
 
-BT_CONN_CB_DEFINE(conn_callbacks) = {
-	.connected = connected,
-	.disconnected = disconnected,
-};
-
-static void hrs_ntf_changed(bool enabled)
+static bool le_param_req(struct bt_conn *conn, struct bt_le_conn_param *param)
 {
-	hrf_ntf_enabled = enabled;
-
-	printk("HRS notification status changed: %s\n",
-	       enabled ? "enabled" : "disabled");
+	//If acceptable params, return true, otherwise return false.
+	return true; 
 }
 
-static struct bt_hrs_cb hrs_cb = {
-	.ntf_changed = hrs_ntf_changed,
-};
-
-static void auth_cancel(struct bt_conn *conn)
+static void le_param_updated(struct bt_conn *conn, uint16_t interval, uint16_t latency, uint16_t timeout)
 {
+	struct bt_conn_info info; 
 	char addr[BT_ADDR_LE_STR_LEN];
-
-	bt_addr_le_to_str(bt_conn_get_dst(conn), addr, sizeof(addr));
-
-	printk("Pairing cancelled: %s\n", addr);
+	
+	if(bt_conn_get_info(conn, &info))
+	{
+		printk("Could not parse connection info\n");
+	}
+	else
+	{
+		bt_addr_le_to_str(bt_conn_get_dst(conn), addr, sizeof(addr));
+		
+		printk("Connection parameters updated!	\n\
+		Connected to: %s						\n\
+		New Connection Interval: %u				\n\
+		New Slave Latency: %u					\n\
+		New Connection Supervisory Timeout: %u	\n"
+		, addr, info.le.interval, info.le.latency, info.le.timeout);
+	}
 }
 
-static struct bt_conn_auth_cb auth_cb_display = {
-	.cancel = auth_cancel,
+static struct bt_conn_cb conn_callbacks = 
+{
+	.connected				= connected,
+	.disconnected   		= disconnected,
+	.le_param_req			= le_param_req,
+	.le_param_updated		= le_param_updated
 };
 
-static void bas_notify(void)
+static void bt_ready(int err)
 {
-	uint8_t battery_level = bt_bas_get_battery_level();
-
-	battery_level--;
-
-	if (!battery_level) {
-		battery_level = 100U;
+	if (err) 
+	{
+		printk("BLE init failed with error code %d\n", err);
+		return;
 	}
 
-	bt_bas_set_battery_level(battery_level);
-}
+	//Configure connection callbacks
+	bt_conn_cb_register(&conn_callbacks);
 
-static void hrs_notify(void)
-{
-	static uint8_t heartrate = 90U;
+	//Initalize services
+	err = my_service_init();
 
-	/* Heartrate measurements simulation */
-	heartrate++;
-	if (heartrate == 160U) {
-		heartrate = 90U;
+	if (err) 
+	{
+		printk("Failed to init LBS (err:%d)\n", err);
+		return;
 	}
 
-	if (hrf_ntf_enabled) {
-		bt_hrs_notify(heartrate);
-	}
-}
-
-#if defined(CONFIG_GPIO)
-/* The devicetree node identifier for the "led0" alias. */
-#define LED0_NODE DT_ALIAS(led0)
-
-#if DT_NODE_HAS_STATUS_OKAY(LED0_NODE)
-#include <zephyr/drivers/gpio.h>
-#define HAS_LED     1
-static const struct gpio_dt_spec led = GPIO_DT_SPEC_GET(LED0_NODE, gpios);
-#define BLINK_ONOFF K_MSEC(500)
-
-static struct k_work_delayable blink_work;
-static bool                  led_is_on;
-
-static void blink_timeout(struct k_work *work)
-{
-	led_is_on = !led_is_on;
-	gpio_pin_set(led.port, led.pin, (int)led_is_on);
-
-	k_work_schedule(&blink_work, BLINK_ONOFF);
-}
-
-static int blink_setup(void)
-{
-	int err;
-
-	printk("Checking LED device...");
-	if (!gpio_is_ready_dt(&led)) {
-		printk("failed.\n");
-		return -EIO;
-	}
-	printk("done.\n");
-
-	printk("Configuring GPIO pin...");
-	err = gpio_pin_configure_dt(&led, GPIO_OUTPUT_ACTIVE);
-	if (err) {
-		printk("failed.\n");
-		return -EIO;
-	}
-	printk("done.\n");
-
-	k_work_init_delayable(&blink_work, blink_timeout);
-
-	return 0;
-}
-
-static void blink_start(void)
-{
-	printk("Start blinking LED...\n");
-	led_is_on = false;
-	gpio_pin_set(led.port, led.pin, (int)led_is_on);
-	k_work_schedule(&blink_work, BLINK_ONOFF);
-}
-
-static void blink_stop(void)
-{
-	struct k_work_sync work_sync;
-
-	printk("Stop blinking LED.\n");
-	k_work_cancel_delayable_sync(&blink_work, &work_sync);
-
-	/* Keep LED on */
-	led_is_on = true;
-	gpio_pin_set(led.port, led.pin, (int)led_is_on);
-}
-#endif /* LED0_NODE */
-#endif /* CONFIG_GPIO */
-
-int main(void)
-{
-	int err;
-
-	err = bt_enable(NULL);
-	if (err) {
-		printk("Bluetooth init failed (err %d)\n", err);
-		return 0;
-	}
-
-	printk("Bluetooth initialized\n");
-
-	bt_conn_auth_cb_register(&auth_cb_display);
-
-	bt_hrs_cb_register(&hrs_cb);
-
-#if !defined(CONFIG_BT_EXT_ADV)
-	printk("Starting Legacy Advertising (connectable and scannable)\n");
-	err = bt_le_adv_start(BT_LE_ADV_CONN_ONE_TIME, ad, ARRAY_SIZE(ad), sd, ARRAY_SIZE(sd));
-	if (err) {
+	//Start advertising
+	err = bt_le_adv_start(BT_LE_ADV_CONN, ad, ARRAY_SIZE(ad),
+			      sd, ARRAY_SIZE(sd));
+	if (err) 
+	{
 		printk("Advertising failed to start (err %d)\n", err);
-		return 0;
+		return;
 	}
-
-#else /* CONFIG_BT_EXT_ADV */
-	struct bt_le_adv_param adv_param = {
-		.id = BT_ID_DEFAULT,
-		.sid = 0U,
-		.secondary_max_skip = 0U,
-		.options = (BT_LE_ADV_OPT_EXT_ADV |
-			    BT_LE_ADV_OPT_CONNECTABLE |
-			    BT_LE_ADV_OPT_CODED),
-		.interval_min = BT_GAP_ADV_FAST_INT_MIN_2,
-		.interval_max = BT_GAP_ADV_FAST_INT_MAX_2,
-		.peer = NULL,
-	};
-	struct bt_le_ext_adv *adv;
-
-	printk("Creating a Coded PHY connectable non-scannable advertising set\n");
-	err = bt_le_ext_adv_create(&adv_param, NULL, &adv);
-	if (err) {
-		printk("Failed to create Coded PHY extended advertising set (err %d)\n", err);
-
-		printk("Creating a non-Coded PHY connectable non-scannable advertising set\n");
-		adv_param.options &= ~BT_LE_ADV_OPT_CODED;
-		err = bt_le_ext_adv_create(&adv_param, NULL, &adv);
-		if (err) {
-			printk("Failed to create extended advertising set (err %d)\n", err);
-			return 0;
-		}
-	}
-
-	printk("Setting extended advertising data\n");
-	err = bt_le_ext_adv_set_data(adv, ad, ARRAY_SIZE(ad), NULL, 0);
-	if (err) {
-		printk("Failed to set extended advertising data (err %d)\n", err);
-		return 0;
-	}
-
-	printk("Starting Extended Advertising (connectable non-scannable)\n");
-	err = bt_le_ext_adv_start(adv, BT_LE_EXT_ADV_START_DEFAULT);
-	if (err) {
-		printk("Failed to start extended advertising set (err %d)\n", err);
-		return 0;
-	}
-#endif /* CONFIG_BT_EXT_ADV */
 
 	printk("Advertising successfully started\n");
 
-#if defined(HAS_LED)
-	err = blink_setup();
-	if (err) {
+	k_sem_give(&ble_init_ok);
+}
+
+static void error(void)
+{
+	while (true) {
+		printk("Error!\n");
+		/* Spin for ever */
+		k_sleep(K_MSEC(1000)); //1000ms
+	}
+}
+
+int main(void)
+{
+	static struct i2c_dt_spec mpu6050_dev = I2C_DT_SPEC_GET(DT_NODELABEL(i2c_device0));
+	static struct i2c_dt_spec max30102_dev = I2C_DT_SPEC_GET(DT_NODELABEL(i2c_device1));
+	if (!i2c_is_ready_dt(&mpu6050_dev))
+	{
+		printk("MPU6050 is not ready.\n");
 		return 0;
 	}
+	printk("MPU6050 is ready.\n");
+	init_mpu6050(&mpu6050_dev);
+	printk("MPU6050 is initialized.\n");
+	if (!i2c_is_ready_dt(&max30102_dev))
+	{
+		printk("MAX30102 is not ready.\n");
+		return 0;
+	}
+	printk("MAX30102 is ready.\n");
+	init_max30102(&max30102_dev);
+	printk("MAX30102 is initialized.\n");
+	
+	int err = 0;
+	uint32_t number = 0;
 
-	blink_start();
-#endif /* HAS_LED */
+	printk("Starting BLE peripheral.\n");
 
-	/* Implement notification. */
-	while (1) {
-		k_sleep(K_SECONDS(1));
+	
+	err = bt_enable(bt_ready);
 
-		/* Heartrate measurements simulation */
-		hrs_notify();
+	if (err) 
+	{
+		printk("BLE initialization failed\n");
+		error(); //Catch error
+	}
+	
+	/* 	Bluetooth stack should be ready in less than 100 msec. 								\
+																							\
+		We use this semaphore to wait for bt_enable to call bt_ready before we proceed 		\
+		to the main loop. By using the semaphore to block execution we allow the RTOS to 	\
+		execute other tasks while we wait. */	
+	err = k_sem_take(&ble_init_ok, K_MSEC(500));
 
-		/* Battery level simulation */
-		bas_notify();
+	if (!err) 
+	{
+		printk("Bluetooth initialized\n");
+	} else 
+	{
+		printk("BLE initialization did not complete in time\n");
+		error(); //Catch error
+	}
 
-		if (atomic_test_and_clear_bit(state, STATE_CONNECTED)) {
-			/* Connected callback executed */
+	//Initalize services
+	err = my_service_init();
 
-#if defined(HAS_LED)
-			blink_stop();
-#endif /* HAS_LED */
-		} else if (atomic_test_and_clear_bit(state, STATE_DISCONNECTED)) {
-#if !defined(CONFIG_BT_EXT_ADV)
-			printk("Starting Legacy Advertising (connectable and scannable)\n");
-			err = bt_le_adv_start(BT_LE_ADV_CONN_ONE_TIME, ad, ARRAY_SIZE(ad), sd,
-					      ARRAY_SIZE(sd));
-			if (err) {
-				printk("Advertising failed to start (err %d)\n", err);
-				return 0;
-			}
-
-#else /* CONFIG_BT_EXT_ADV */
-			printk("Starting Extended Advertising (connectable and non-scannable)\n");
-			err = bt_le_ext_adv_start(adv, BT_LE_EXT_ADV_START_DEFAULT);
-			if (err) {
-				printk("Failed to start extended advertising set (err %d)\n", err);
-				return 0;
-			}
-#endif /* CONFIG_BT_EXT_ADV */
-
-#if defined(HAS_LED)
-			blink_start();
-#endif /* HAS_LED */
-		}
+	for (;;) 
+	{
+		// Main loop
+		my_service_send(my_connection, (uint8_t *)&number, sizeof(number));
+		number++;
+		k_sleep(K_MSEC(1000)); // 1000ms
 	}
 
 	return 0;
 }
+
