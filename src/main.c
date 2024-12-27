@@ -180,8 +180,6 @@ static void error(void)
 	}
 }
 
-int 
-
 int main(void)
 {
 	static struct i2c_dt_spec mpu6050_dev = I2C_DT_SPEC_GET(DT_NODELABEL(i2c_device0));
