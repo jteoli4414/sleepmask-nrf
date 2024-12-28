@@ -125,7 +125,7 @@ void max_setup(max_ctx_t * ctx, uint8_t pwr_lev_red, uint8_t pwr_lev_ir, uint8_t
 
 uint32_t max_get_red(max_ctx_t * ctx)
 {
-    if(max_safe_check(ctx, 250000))
+    if(max_safe_check(ctx, 10000))
     {
         return(ctx->red[ctx->head]);
     }
@@ -136,7 +136,7 @@ uint32_t max_get_red(max_ctx_t * ctx)
 }
 uint32_t max_get_ir(max_ctx_t * ctx)
 {
-    if(max_safe_check(ctx, 250000))
+    if(max_safe_check(ctx, 10000))
     {
         return(ctx->ir[ctx->head]);
     }

@@ -16,10 +16,10 @@
 #define BT_UUID_MY_SERVICE_RX   BT_UUID_DECLARE_128(RX_CHARACTERISTIC_UUID)
 #define BT_UUID_MY_SERVICE_TX   BT_UUID_DECLARE_128(TX_CHARACTERISTIC_UUID)
 
-#define MAX_TRANSMIT_SIZE 240//TODO figure this out
-
 uint8_t data_rx[MAX_TRANSMIT_SIZE];
 uint8_t data_tx[MAX_TRANSMIT_SIZE];
+
+uint8_t command_waiting;
 
 int my_service_init(void)
 {

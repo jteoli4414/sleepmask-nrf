@@ -27,6 +27,19 @@ mpu_ctx_t * mpu_c;
 
 struct bt_conn *my_connection;
 
+typedef struct __attribute__((packed)){
+	uint32_t uptime;
+	uint32_t red_light;
+	uint32_t ir_light;
+	uint32_t accel_x;
+	uint32_t accel_y;
+	uint32_t accel_z;
+} data_sample_t;
+
+typedef struct __attribute__((packed)){
+	data_sample_t samples[10];
+} data_packet_t;
+
 #define DEVICE_NAME 		CONFIG_BT_DEVICE_NAME // Set in proj.conf
 #define DEVICE_NAME_LEN        	(sizeof(DEVICE_NAME) - 1)
 static K_SEM_DEFINE(ble_init_ok, 0, 1);
@@ -34,9 +47,9 @@ static K_SEM_DEFINE(ble_init_ok, 0, 1);
 void init_max30102(struct i2c_dt_spec * dev)
 {
 	max_c = max_create(dev);
-	uint8_t redLedBrightness = 0x30; // Options: 0=Off to 255=50mA
-	uint8_t irLedBrightness = 0x30;	 // Options: 0=Off to 255=50mA
-	uint8_t sampleAverage = 4;		 // Options: 1, 2, 4, 8, 16, 32
+	uint8_t redLedBrightness = 0x1f; // Options: 0=Off to 255=50mA
+	uint8_t irLedBrightness = 0x1f;	 // Options: 0=Off to 255=50mA
+	uint8_t sampleAverage = 1;		 // Options: 1, 2, 4, 8, 16, 32
 	uint8_t ledMode = 2;			 // Options: 1 = Red only, 2 = Red + IR
 	int sampleRate = 3200;			 // Options: 50, 100, 200, 400, 800, 1000, 1600, 3200
 	int pulseWidth = 69;			 // Options: 69, 118, 215, 411
@@ -180,10 +193,26 @@ static void error(void)
 	}
 }
 
+void print_sample(data_sample_t sample)
+{
+	printk("========================================\n");
+	printk("uptime: %u \n", sample.uptime);
+	printk("red: %u ir: %u\n", sample.red_light, sample.ir_light);
+	printk("ax: %u ay: %u az: %u\n", sample.accel_x, sample.accel_y, sample.accel_z);
+	printk("========================================\n");
+}
+
 int main(void)
 {
 	static struct i2c_dt_spec mpu6050_dev = I2C_DT_SPEC_GET(DT_NODELABEL(i2c_device0));
 	static struct i2c_dt_spec max30102_dev = I2C_DT_SPEC_GET(DT_NODELABEL(i2c_device1));
+	int err = 0;
+	uint32_t number = 0;
+	data_packet_t packet;
+	data_sample_t sample;
+	uint16_t ax, ay, az = 0;
+	uint32_t red, ir = 0;
+	uint32_t uptime = 0;
 	if (!i2c_is_ready_dt(&mpu6050_dev))
 	{
 		printk("MPU6050 is not ready.\n");
@@ -200,9 +229,8 @@ int main(void)
 	printk("MAX30102 is ready.\n");
 	init_max30102(&max30102_dev);
 	printk("MAX30102 is initialized.\n");
-	
-	int err = 0;
-	uint32_t number = 0;
+
+	memset(&packet, 0, sizeof(data_packet_t));
 
 	printk("Starting BLE peripheral.\n");
 
@@ -236,10 +264,30 @@ int main(void)
 
 	for (;;) 
 	{
+		uint32_t now;
+		uint32_t later;
+		now = k_uptime_get_32();
+		for (int i = 0; i < 10; i++)
+		{
+			memset(&sample, 0, sizeof(data_sample_t));
+			sample.uptime = k_uptime_get_32();
+			MPU6050_getAcceleration(mpu_c, &ax, &ay, &az);
+			sample.accel_x = (uint32_t)((UINT32_MAX/2) + ax);
+			sample.accel_y = (uint32_t)((UINT32_MAX/2) + ay);
+			sample.accel_z = (uint32_t)((UINT32_MAX/2) + az);
+			red = max_get_red(max_c);
+            ir = max_get_ir(max_c);
+			sample.red_light = red;
+			sample.ir_light = ir;
+			memcpy(&packet.samples[i], &sample, sizeof(data_sample_t));
+			//print_sample(sample);
+		}
+		later = k_uptime_get_32();
+		printk("Time to Record: %d\n", later-now);
+		//printk("Size of packet: %d\n", sizeof(data_packet_t));
 		// Main loop
-		my_service_send(my_connection, (uint8_t *)&number, sizeof(number));
-		number++;
-		k_sleep(K_MSEC(1000)); // 1000ms
+		my_service_send(my_connection, (uint8_t *)&packet, sizeof(data_packet_t));
+		//k_sleep(K_MSEC(1000)); // 1000ms
 	}
 
 	return 0;

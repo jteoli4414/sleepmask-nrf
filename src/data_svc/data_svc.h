@@ -19,6 +19,8 @@
 #define TX_CHARACTERISTIC_UUID  0xED, 0xAA, 0x20, 0x11, 0x92, 0xE7, 0x43, 0x5A, \
 			                    0xAA, 0xE9, 0x94, 0x43, 0x35, 0x6A, 0xD4, 0xD3
 
+#define MAX_TRANSMIT_SIZE 240//TODO figure this out
+
 /** @brief Callback type for when new data is received. */
 typedef void (*data_rx_cb_t)(uint8_t *data, uint8_t length);
 
@@ -32,3 +34,11 @@ struct my_service_cb
 int my_service_init(void);
 
 void my_service_send(struct bt_conn *conn, const uint8_t *data, uint16_t len);
+
+typedef enum {
+    CMD_START_RECORDING                         = 0,
+    CMD_STOP_RECORDING                          = 1,
+    CMD_LED_CONTROL                             = 2,
+    CMD_TOGGLE_SAMPLING                         = 3,
+    CMD_CHECK_STATE                             = 4
+} command_id_t;
